@@ -146,30 +146,56 @@
       if (!video) return;
       const loading = preview.querySelector('.preview-status.loading'), error = preview.querySelector('.preview-status.error');
       let loadingTimer, reconnectTimer, reconnectAttempt = 0;
+      let disposed = false, switchingStream = false;
+      const observer = new MutationObserver(() => {
+        if (!card.isConnected || !video.isConnected) {
+          disposed = true;
+          clearTimeout(loadingTimer);
+          clearTimeout(reconnectTimer);
+          switchingStream = true;
+          video.pause();
+          video.removeAttribute('src');
+          video.load();
+          if (audio) { audio.pause(); audio.removeAttribute('src'); audio.load(); }
+          observer.disconnect();
+        }
+      });
+      observer.observe(grid, {childList: true, subtree: true});
       const streamUrl = () => `/stream/${encodeURIComponent(card.dataset.id)}.mp4?native=${Date.now()}`;
       const hideLoading = () => loading?.classList.add('hidden');
       const scheduleLoadingFallback = () => { clearTimeout(loadingTimer); loadingTimer = setTimeout(hideLoading, 3500); };
       const setStreamState = failed => { if (failed) { clearTimeout(loadingTimer); hideLoading(); } else scheduleLoadingFallback(); error?.classList.toggle('hidden', !failed); };
       const ready = () => { clearTimeout(loadingTimer); hideLoading(); setStreamState(false); };
       const scheduleReconnect = reason => {
-        if (reconnectTimer) return;
+        if (disposed || switchingStream || !card.isConnected || !video.isConnected || reconnectTimer) return;
         const delay = Math.min(1000 * (2 ** reconnectAttempt), 10000);
         reconnectAttempt = Math.min(reconnectAttempt + 1, 4);
         if (reason) { error?.classList.remove('hidden'); error?.firstChild && (error.firstChild.textContent = reason); }
         reconnectTimer = setTimeout(() => {
           reconnectTimer = null;
+          if (disposed || !card.isConnected || !video.isConnected) return;
+          switchingStream = true;
           video.pause();
           video.removeAttribute('src');
           video.load();
           video.src = streamUrl();
-          video.load();
           loading?.classList.remove('hidden');
           setStreamState(false);
+          switchingStream = false;
           const playback = video.play();
           if (playback) playback.catch(() => {});
         }, delay);
       };
-      const handleError = () => { setStreamState(true); scheduleReconnect('Stream interrupted. Reconnecting…'); };
+      const handleError = () => {
+        if (disposed || switchingStream || !card.isConnected || !video.isConnected) return;
+        setStreamState(true);
+        scheduleReconnect('Stream interrupted. Reconnecting…');
+        api(`/api/cameras/${encodeURIComponent(card.dataset.id)}/media-status`).then(status => {
+          if (disposed || !card.isConnected) return;
+          const detail = status.error || (status.ffmpeg || []).join(' | ') || status.stage;
+          if (detail && error?.firstChild) error.firstChild.textContent = `${detail} · Reconnecting… `;
+        }).catch(() => {});
+      };
       video.addEventListener('loadedmetadata', ready); video.addEventListener('loadeddata', ready); video.addEventListener('canplay', ready); video.addEventListener('playing', () => { ready(); reconnectAttempt = 0; }); video.addEventListener('error', handleError); video.addEventListener('ended', () => scheduleReconnect('Stream ended. Reconnecting…'));
       scheduleLoadingFallback();
       preview.querySelector('.retry-button')?.addEventListener('click', event => { event.stopPropagation(); reconnectAttempt = 0; scheduleReconnect('Retrying stream…'); });
@@ -347,7 +373,7 @@
     async function toggleFullscreen(card) { try { if (fullscreenElement() === card || card.classList.contains('is-fullscreen')) { card.classList.remove('is-fullscreen'); if (document.exitFullscreen) await document.exitFullscreen(); else if (document.webkitExitFullscreen) document.webkitExitFullscreen(); } else { if (fullscreenElement()) { if (document.exitFullscreen) await document.exitFullscreen(); else if (document.webkitExitFullscreen) document.webkitExitFullscreen(); } card.classList.add('is-fullscreen'); const request = card.requestFullscreen || card.webkitRequestFullscreen; if (!request) throw new Error('Fullscreen is not supported by this version'); await request.call(card); } } catch (error) { card.classList.remove('is-fullscreen'); const result = card.querySelector('.result'); result.textContent = error.message; result.className = 'meta bad result'; } finally { updateFullscreenButtons(); } }
     document.addEventListener('fullscreenchange', updateFullscreenButtons); document.addEventListener('webkitfullscreenchange', updateFullscreenButtons);
     window.addEventListener('resize', repositionOpenMovementPanels); window.addEventListener('scroll', repositionOpenMovementPanels, true);
-    async function checkRelay(id, button, result) { button.disabled = true; result.textContent = 'Checking cloud relay…'; result.className = 'meta'; try { const data = await api(`/api/cameras/${encodeURIComponent(id)}/relay-check`); result.textContent = data.ok ? 'Cloud relay available.' : (data.error || 'Relay unavailable'); result.className = `meta ${data.ok ? 'ok' : 'bad'}`; } catch (error) { result.textContent = error.message; result.className = 'meta bad'; } finally { button.disabled = false; } }
+    async function checkRelay(id, button, result) { if (!result) return; button.disabled = true; result.textContent = 'Checking cloud relay…'; result.className = 'meta'; try { const data = await api(`/api/cameras/${encodeURIComponent(id)}/relay-check`); result.textContent = data.ok ? 'Cloud relay available.' : (data.error || 'Relay unavailable'); result.className = `meta ${data.ok ? 'ok' : 'bad'}`; } catch (error) { result.textContent = error.message; result.className = 'meta bad'; } finally { button.disabled = false; } }
     async function setPrivacy(id, button, card) { if (card.dataset.privacyBusy === 'true') return; const enabled = button.dataset.enabled === 'true', result = card.querySelector('.privacy-result'), previousText = button.textContent, controller = new AbortController(); let timedOut = false; card.dataset.privacyBusy = 'true'; button.disabled = true; button.setAttribute('aria-busy', 'true'); button.textContent = enabled ? 'Enabling…' : 'Disabling…'; result.textContent = enabled ? 'Enabling privacy…' : 'Disabling privacy…'; result.className = 'meta'; const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 15000); try { const data = await api(`/api/cameras/${encodeURIComponent(id)}/privacy`, {method: 'POST', signal: controller.signal, headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled})}); if (typeof data.privacy !== 'boolean') throw new Error('The camera returned an invalid privacy state.'); const isOn = data.privacy; const preview = card.querySelector('.preview'); if (!preview) throw new Error('Camera preview is unavailable.'); preview.innerHTML = `${statusBadge({privacy: isOn})}${previewMarkup({id, name: card.dataset.name, privacy: isOn})}`; bindStream(card); card.querySelectorAll('.ptz-button').forEach(control => { if (control.dataset.x !== '0' || control.dataset.y !== '0') control.disabled = isOn; }); button.dataset.enabled = String(!isOn); button.textContent = isOn ? 'Disable privacy' : 'Enable privacy'; result.textContent = isOn ? 'Privacy enabled: video and audio paused.' : 'Privacy disabled.'; result.className = `meta ${isOn ? 'privacy-on' : 'ok'}`; try { await refreshCard(card, id); } catch (_) { /* The local state is already updated; keep the card usable if refresh fails. */ } } catch (error) { button.textContent = previousText; result.textContent = timedOut ? 'Privacy request timed out. Try again.' : (error.message || 'Privacy request failed.'); result.className = 'meta bad'; } finally { clearTimeout(timeout); card.dataset.privacyBusy = 'false'; button.removeAttribute('aria-busy'); button.disabled = false; } }
     async function moveCamera(button, card) { const step = STEP_VALUES[card.querySelector('.step-select')?.value || 'medium'], x = Number(button.dataset.x) * step, y = Number(button.dataset.y) * step, result = card.querySelector('.ptz-result'), controls = [...card.querySelectorAll('.ptz-button')]; controls.forEach(control => { if (!control.disabled || control === button) control.disabled = true; }); result.textContent = 'Moving…'; result.className = 'meta ptz-result'; try { await api(`/api/cameras/${encodeURIComponent(card.dataset.id)}/move`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({x, y})}); result.textContent = `Move sent · step ${step}°.`; result.className = 'meta ptz-result ok'; } catch (error) { result.textContent = error.message; result.className = 'meta ptz-result bad'; } finally { const privacyOn = card.querySelector('.privacy-button')?.dataset.enabled === 'false'; controls.forEach(control => { if (control.dataset.x !== '0' || control.dataset.y !== '0') control.disabled = privacyOn; }); } }
     loginForm.addEventListener('submit', async event => { event.preventDefault(); loginButton.disabled = true; loginError.textContent = 'Logging in…'; try { const data = await api('/api/login', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({username: document.querySelector('#username').value, password: document.querySelector('#password').value})}); if (data.mfa_required) showMfa(data.mfa_types); else { showApp(); await load(); } } catch (error) { loginError.textContent = error.message; } finally { loginButton.disabled = false; } });
@@ -362,3 +388,4 @@
   </script>
 </body>
 </html>
+

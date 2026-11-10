@@ -2,7 +2,7 @@ name: Windows installer
 
 on:
   push:
-    branches: [main, feature/windows-installer]
+    branches: [main, feature/windows-installer, fix/c200-stream-diagnostics]
     tags: ['v*']
   workflow_dispatch:
 
@@ -21,6 +21,10 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+
+      - name: Test media error handling
+        shell: pwsh
+        run: python -m unittest discover -s tests -v
 
       - name: Build cloud backend
         shell: pwsh
@@ -103,3 +107,4 @@ jobs:
             --repo $env:GITHUB_REPOSITORY `
             --title "Topo $env:GITHUB_REF_NAME" `
             --generate-notes
+

@@ -3,7 +3,7 @@ const { spawn } = require('child_process');
 const https = require('https');
 const path = require('path');
 
-const REPOSITORY = 'filirnd/topo';
+const REPOSITORY = 'lukaskrnac/topo';
 const LOCAL_HOST = '127.0.0.1';
 
 let backend = null;
@@ -242,3 +242,4 @@ app.on('before-quit', () => {
   stopBackend();
 });
 app.on('window-all-closed', () => app.quit());
+
