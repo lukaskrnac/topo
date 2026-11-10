@@ -8,7 +8,7 @@ from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from tapo_cloud_app import CloudMediaWorker, Handler, NATIVE_STREAM_RESET, safe_media_error
+from tapo_cloud_app import CloudMediaWorker, Handler, NATIVE_STREAM_RESET, safe_media_error, relay_route, MediaSocketReader
 
 
 class MediaTests(unittest.TestCase):
@@ -16,9 +16,10 @@ class MediaTests(unittest.TestCase):
         subscriber = queue.Queue()
         for chunk in chunks:
             subscriber.put(chunk)
+        unsubscribed = threading.Event()
         worker = SimpleNamespace(
             subscribe_native_video=lambda: subscriber,
-            unsubscribe_native_video=Mock(),
+            unsubscribe_native_video=Mock(side_effect=lambda subscriber: unsubscribed.set()),
             last_error=error, media_stage='relay connection', ffmpeg_errors=deque(),
         )
         state = SimpleNamespace(worker=lambda index: worker, devices=[{}])
@@ -35,6 +36,7 @@ class MediaTests(unittest.TestCase):
             response = connection.getresponse()
             result = response.status, response.read().decode()
             connection.close()
+            self.assertTrue(unsubscribed.wait(1))
             worker.unsubscribe_native_video.assert_called_once_with(subscriber)
             return result
         finally:
@@ -84,6 +86,39 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(len(worker.ffmpeg_errors), 8)
         self.assertEqual(worker.ffmpeg_errors[-1], 'bad codec')
         self.assertTrue(process.stderr.closed)
+
+    def test_cdn_uses_relay_signed_path_without_reencoding(self):
+        host, port, path, origin = relay_route({
+            'relayUrl': 'https://relay.example:444/live?opaque+signature%2F',
+            'cdnUrl': 'https://cdn.example:8443/ignored',
+            'relayBusinessUrl': 'https://origin.example:443',
+        }, True)
+        self.assertEqual((host, port), ('cdn.example', 8443))
+        self.assertEqual(path, '/live?opaque+signature%2F&retryTime=0')
+        self.assertEqual(origin, 'origin.example:443')
+
+    def test_missing_cdn_falls_back_to_direct(self):
+        self.assertEqual(relay_route({'relayUrl': 'relay.example/live'}, True),
+                         ('relay.example', 443, '/live?retryTime=0', ''))
+
+    def test_media_counter_counts_bytes_without_saving_payload(self):
+        worker = SimpleNamespace(media_bytes=3)
+        sock = Mock()
+        sock.recv.return_value = b'private video'
+        reader = MediaSocketReader(sock, worker)
+        self.assertEqual(reader.recv(64), b'private video')
+        self.assertEqual(worker.media_bytes, 16)
+
+    def test_diagnostic_keeps_last_failure_during_retry(self):
+        worker = CloudMediaWorker.__new__(CloudMediaWorker)
+        worker.media_stage = 'relay negotiation'
+        worker.last_error = ''
+        worker.last_failure = 'previous timeout'
+        worker.relay_transport = 'cdn'
+        worker.media_bytes = 0
+        worker.media_parts = 0
+        worker.ffmpeg_errors = deque()
+        self.assertEqual(worker.media_status()['error'], 'previous timeout')
 
     def test_diagnostic_redacts_relay_url_and_token(self):
         result = safe_media_error('failure https://relay.example/path?token=secret X-token=private')

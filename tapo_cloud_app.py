@@ -66,6 +66,38 @@ def safe_media_error(value: object) -> str:
     return text[:1200]
 
 
+def relay_route(relay_info: dict, use_cdn: bool) -> tuple[str, int, str, str]:
+    """Keep the signed relay path; a CDN is a different connection host only."""
+    relay_url = str(relay_info.get("relayUrl") or "")
+    parsed = urlsplit(relay_url if "://" in relay_url else "https://" + relay_url)
+    connect_url = str(relay_info.get("cdnUrl") or "") if use_cdn else ""
+    cdn_origin = ""
+    if connect_url:
+        target = urlsplit(connect_url if "://" in connect_url else "https://" + connect_url)
+        origin = str(relay_info.get("relayBusinessUrl") or "")
+        if origin:
+            cdn_origin = urlsplit(origin if "://" in origin else "https://" + origin).netloc
+    else:
+        target = parsed
+    if not target.hostname:
+        raise RuntimeError("relay has no hostname")
+    path = parsed.path or "/"
+    path += "?" + parsed.query + "&retryTime=0" if parsed.query else "?retryTime=0"
+    return target.hostname, target.port or 443, path, cdn_origin
+
+
+class MediaSocketReader:
+    """Count bytes after HTTP headers without recording private media."""
+    def __init__(self, sock, worker):
+        self.sock = sock
+        self.worker = worker
+
+    def recv(self, size):
+        chunk = self.sock.recv(size)
+        self.worker.media_bytes += len(chunk)
+        return chunk
+
+
 def native_player_path() -> Path | None:
     """Return the bundled native decoder, when this build includes one."""
     override = os.environ.get("TOPO_NATIVE_PLAYER")
@@ -206,6 +238,11 @@ class CloudMediaWorker:
         )
         self.last_error = ""
         self.media_stage = "idle"
+        self.last_failure = ""
+        self.relay_attempt = 0
+        self.media_bytes = 0
+        self.media_parts = 0
+        self.relay_transport = "direct"
         self.ffmpeg_errors = deque(maxlen=8)
         self.native_lock = threading.RLock()
         self.relay_lock = threading.Lock()
@@ -464,10 +501,16 @@ class CloudMediaWorker:
                 self.ffmpeg_errors.clear()
                 self._relay_once()
             except (OSError, RuntimeError, ssl.SSLError, EOFError) as exc:
-                self.last_error = safe_media_error(f"{self.media_stage}: {exc}")
+                self.last_error = safe_media_error(
+                    f"{self.media_stage} [{self.relay_transport}; "
+                    f"{self.media_bytes} bytes, {self.media_parts} parts]: {exc}"
+                )
             except Exception as exc:  # Keep a broken relay from killing the worker.
                 self.last_error = safe_media_error(f"{self.media_stage}: unexpected media error: {exc}")
             finally:
+                if self.last_error:
+                    self.last_failure = self.last_error
+                self.relay_attempt += 1
                 self._broadcast_native_reset()
             if self.last_error and not self.stop.is_set():
                 print(f"[media] {self.last_error}", flush=True)
@@ -477,6 +520,8 @@ class CloudMediaWorker:
         device_id = str(self.device.get("deviceId") or "")
         if not device_id:
             raise RuntimeError("camera has no deviceId")
+        self.media_bytes = 0
+        self.media_parts = 0
         self.media_stage = "relay negotiation"
         self.client.discover_cipc_url(self.base_url)
         player_id = str(uuid.uuid4())
@@ -499,15 +544,9 @@ class CloudMediaWorker:
         relay_token = str(relay_info.get("relayToken") or relay_info.get("sessionToken") or "")
         if not relay_url or not relay_token:
             raise RuntimeError("incomplete relay response")
-        parsed = urlsplit(relay_url if "://" in relay_url else "https://" + relay_url)
-        host = parsed.hostname
-        if not host:
-            raise RuntimeError("relay has no hostname")
-        path = parsed.path or "/"
-        if parsed.query:
-            path += "?" + parsed.query + "&retryTime=0"
-        else:
-            path += "?retryTime=0"
+        use_cdn = bool(self.relay_attempt % 2 and relay_info.get("cdnUrl"))
+        host, port, path, cdn_origin = relay_route(relay_info, use_cdn)
+        self.relay_transport = "cdn" if use_cdn else "direct"
         headers = {
             "Host": host,
             "User-Agent": "Client=TP-Link_Tapo_Android Android 3.21.114/1.3",
@@ -527,6 +566,10 @@ class CloudMediaWorker:
             "X-Arrive-Latency": "0",
             "Connection": "Keep-alive",
         }
+        if cdn_origin:
+            headers["X-CDN-Origin"] = cdn_origin
+        if use_cdn:
+            headers["Content-Length"] = "21474836470"
         if relay_info.get("elbCookie"):
             headers["Cookie"] = str(relay_info["elbCookie"])
         raw_request = (
@@ -549,7 +592,7 @@ class CloudMediaWorker:
         native_process = None
         try:
             self.media_stage = "relay connection"
-            with socket.create_connection((host, parsed.port or 443), timeout=15) as plain_socket:
+            with socket.create_connection((host, port), timeout=15) as plain_socket:
                 with self.client.verify_context.wrap_socket(
                     plain_socket, server_hostname=host
                 ) as tls_socket:
@@ -565,7 +608,13 @@ class CloudMediaWorker:
                     tls_socket.sendall(raw_request)
                     buffer = bytearray()
                     self.media_stage = "relay HTTP response"
-                    self._read_http_headers(tls_socket, buffer)
+                    response_headers = self._read_http_headers(tls_socket, buffer)
+                    # Honor a relay node's MIME boundary rather than assuming
+                    # every region uses the same device boundary string.
+                    match = re.search(br'boundary\s*=\s*(?:"([^"]+)"|([^;\s]+))', response_headers, re.I)
+                    media_boundary = (match.group(1) or match.group(2)) if match else b"--device-stream-boundary--"
+                    self.media_bytes = len(buffer)
+                    media_reader = MediaSocketReader(tls_socket, self)
                     # The JPEG decoder is needed only by the legacy MJPEG
                     # subscribers. Audio extraction reads the relay MPEG-TS
                     # directly; starting this decoder for audio-only clients
@@ -689,7 +738,7 @@ class CloudMediaWorker:
                     self.media_stage = "waiting for relay media"
                     tls_socket.settimeout(20)
                     while not self.stop.is_set():
-                        boundary = self._read_line(tls_socket, buffer)
+                        boundary = self._read_line(media_reader, buffer)
                         if not boundary:
                             continue
                         if boundary in (b"\r", b"\n"):
@@ -699,11 +748,12 @@ class CloudMediaWorker:
                         # own two leading hyphens, so the wire line normally
                         # starts with four (`----device...`). The Android
                         # parser matches the boundary name by containment.
-                        if b"--device-stream-boundary--" not in boundary:
+                        if media_boundary not in boundary:
                             continue
+                        self.media_stage = "reading relay part headers"
                         part_headers: dict[str, str] = {}
                         while True:
-                            line = self._read_line(tls_socket, buffer)
+                            line = self._read_line(media_reader, buffer)
                             if not line:
                                 break
                             key, value = line.decode("latin1").split(":", 1)
@@ -711,6 +761,7 @@ class CloudMediaWorker:
                         if part_headers.get("x-if-encrypt") == "1":
                             raise RuntimeError("relay video is encrypted: decoder is not available yet")
                         length = int(part_headers.get("content-length", "0"))
+                        self.media_parts += 1
                         # `/v2/relay/request` is a video-only request. Some
                         # relay nodes have returned an incomplete or unusual
                         # Content-Type value, but the payload is still the
@@ -747,7 +798,7 @@ class CloudMediaWorker:
                             if native_video_ffmpeg is not None and native_video_ffmpeg.poll() is not None:
                                 raise RuntimeError(self.ffmpeg_failure(native_video_ffmpeg))
                             self._pipe_exact(
-                                tls_socket,
+                                media_reader,
                                 buffer,
                                 length,
                                 outputs,
@@ -755,7 +806,7 @@ class CloudMediaWorker:
                                 audio_ffmpeg,
                             )
                         else:
-                            self._read_exact(tls_socket, buffer, length)
+                            self._read_exact(media_reader, buffer, length)
                     with self.relay_lock:
                         if self.relay_socket is tls_socket:
                             self.relay_socket = None
@@ -976,7 +1027,10 @@ class CloudMediaWorker:
     def media_status(self) -> dict:
         return {
             "stage": self.media_stage,
-            "error": safe_media_error(self.last_error),
+            "error": safe_media_error(self.last_error or self.last_failure),
+            "route": self.relay_transport,
+            "received_bytes": self.media_bytes,
+            "received_parts": self.media_parts,
             "ffmpeg": [safe_media_error(line) for line in tuple(self.ffmpeg_errors)],
         }
 
@@ -1004,6 +1058,7 @@ class CloudMediaWorker:
                     with self.lock:
                         self.native_init_segment = init_segment
                     init_segment_saved = True
+            self.last_failure = ""
             self._broadcast_native_video(chunk)
 
     def _read_audio(self, ffmpeg: subprocess.Popen) -> None:
